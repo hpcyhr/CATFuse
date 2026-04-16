@@ -1,6 +1,9 @@
 *.md
 *.json
+*.log
+*.pyc
 
 data/
 
 results/
+
