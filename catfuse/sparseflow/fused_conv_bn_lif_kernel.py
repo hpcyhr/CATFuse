@@ -1,0 +1,539 @@
+"""
+CATFuse-SF Fused Sparse Conv + BN + LIF — v1.0
+
+Based on SparseFlow fused_conv_lif v18.0.
+Additions for CATFuse integration:
+  - BN affine (bn_scale, bn_bias) applied between conv acc and LIF dynamics
+  - BN params precomputed from BatchNorm2d (inference mode fold)
+  - Compatible with TimeBlock(K) loop via v_prev/v_next chaining
+"""
+
+import torch
+import warnings
+import triton
+import triton.language as tl
+from triton import autotune, Config
+from catfuse.sparseflow.config import ENABLE_RUNTIME_FALLBACK_POLICY
+
+from catfuse.sparseflow.sparse_conv2d_kernel import (
+    FALLBACK_RATIO,
+    choose_group_size,
+    _select_tile_sizes,
+    _build_two_stage_metadata,
+    _check_dense_fallback,
+    _make_configs,
+)
+
+
+def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
+    BH, BW = _select_tile_sizes(H, W)
+    gs = choose_group_size(C_IN)
+    return BH, BW, BH * BW, 64, gs
+
+
+def _make_fused_configs(bh, bw):
+    bm = bh * bw
+    cfgs = []
+    for bn in [64, 128]:
+        for nw in [4, 8]:
+            cfgs.append(
+                Config(
+                    {
+                        "BLOCK_M": bm,
+                        "BLOCK_N": bn,
+                        "BLOCK_H": bh,
+                        "BLOCK_W": bw,
+                    },
+                    num_warps=nw,
+                    num_stages=1,
+                )
+            )
+    return cfgs
+
+
+_FC_8x8 = _make_fused_configs(8, 8)
+_FC_8x16 = _make_fused_configs(8, 16)
+_LEGACY_ARGS_WARNED = False
+
+
+# ===================================================================
+# Fused Conv3x3 + LIF kernels — bitmask-based
+# ===================================================================
+
+@autotune(configs=_FC_8x8, key=["C_IN", "C_OUT", "H", "W", "GH", "GW"])
+@triton.jit
+def fused_bm_conv3x3_bn_lif_8x8(
+    x_ptr,
+    w_cl_ptr,
+    bias_ptr,
+    bn_scale_ptr,
+    bn_bias_ptr,
+    ag_mask_ptr,
+    v_prev_ptr,
+    spike_ptr,
+    v_next_ptr,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_BN: tl.constexpr,
+    SKIP_LIF: tl.constexpr,
+    DECAY: tl.constexpr,
+    RECIP_TAU: tl.constexpr,
+    V_TH: tl.constexpr,
+    HAS_V_RESET: tl.constexpr,
+    V_RESET: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    tile_id = tl.program_id(0)
+    pid_cout = tl.program_id(1)
+
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < C_OUT
+
+    offs_m = tl.arange(0, BLOCK_M)
+    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
+    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
+    m_mask = (out_h < H) & (out_w < W)
+
+    HW: tl.constexpr = H * W
+    W_CS: tl.constexpr = C_IN
+    W_KH: tl.constexpr = 3 * C_IN
+    W_CO: tl.constexpr = 9 * C_IN
+
+    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
+    om = m_mask[:, None] & n_mask[None, :]
+
+    ag_mask = tl.load(ag_mask_ptr + tile_id)
+
+    # Zero-tile fast path
+    if ag_mask == 0:
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        if HAS_BN:
+            acc = acc * tl.load(bn_scale_ptr + offs_n, mask=n_mask, other=1.0)[None, :] \
+                + tl.load(bn_bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+
+        if SKIP_LIF:
+            tl.store(spike_ptr + oa, acc, mask=om)
+        vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+        vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
+        sp = (vt >= V_TH).to(tl.float32)
+        if HAS_V_RESET:
+            v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
+            vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+        else:
+            vn = vt - sp * V_TH
+        tl.store(spike_ptr + oa, sp, mask=om)
+        tl.store(v_next_ptr + oa, vn, mask=om)
+        return
+
+    # Active tile: sparse compute via bitmask
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    for g in range(NUM_GROUPS):
+        g_active = (ag_mask >> g) & 1
+        cin_start = g * GROUP_SIZE_C
+        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+        k_mask = (g_active != 0) & (offs_k < C_IN)
+
+        for kh in tl.static_range(3):
+            for kw in tl.static_range(3):
+                in_h = out_h + (kh - 1)
+                in_w = out_w + (kw - 1)
+                h_ok = (in_h >= 0) & (in_h < H)
+                w_ok = (in_w >= 0) & (in_w < W)
+                safe_h = tl.minimum(tl.maximum(in_h, 0), H - 1)
+                safe_w = tl.minimum(tl.maximum(in_w, 0), W - 1)
+
+                x_addrs = (
+                    x_ptr
+                    + (n_idx * C_IN + offs_k[None, :]) * HW
+                    + safe_h[:, None] * W
+                    + safe_w[:, None]
+                )
+                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+
+                w_addrs = (
+                    w_cl_ptr
+                    + offs_n[None, :] * W_CO
+                    + kh * W_KH
+                    + kw * W_CS
+                    + offs_k[:, None]
+                )
+                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                acc += tl.dot(x_tile, w_tile)
+
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+    if HAS_BN:
+        acc = acc * tl.load(bn_scale_ptr + offs_n, mask=n_mask, other=1.0)[None, :] \
+            + tl.load(bn_bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+
+    # LIF dynamics
+    if SKIP_LIF:
+        om = m_mask[:, None] & n_mask[None, :]
+        tl.store(spike_ptr + oa, acc, mask=om)
+        return
+    vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+    vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
+    sp = (vt >= V_TH).to(tl.float32)
+
+    if HAS_V_RESET:
+        v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
+        vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+    else:
+        vn = vt - sp * V_TH
+
+    tl.store(spike_ptr + oa, sp, mask=om)
+    tl.store(v_next_ptr + oa, vn, mask=om)
+
+
+@autotune(configs=_FC_8x16, key=["C_IN", "C_OUT", "H", "W", "GH", "GW"])
+@triton.jit
+def fused_bm_conv3x3_bn_lif_8x16(
+    x_ptr,
+    w_cl_ptr,
+    bias_ptr,
+    bn_scale_ptr,
+    bn_bias_ptr,
+    ag_mask_ptr,
+    v_prev_ptr,
+    spike_ptr,
+    v_next_ptr,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_BN: tl.constexpr,
+    SKIP_LIF: tl.constexpr,
+    DECAY: tl.constexpr,
+    RECIP_TAU: tl.constexpr,
+    V_TH: tl.constexpr,
+    HAS_V_RESET: tl.constexpr,
+    V_RESET: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    tile_id = tl.program_id(0)
+    pid_cout = tl.program_id(1)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < C_OUT
+    offs_m = tl.arange(0, BLOCK_M)
+    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
+    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
+    m_mask = (out_h < H) & (out_w < W)
+
+    HW: tl.constexpr = H * W
+    W_CS: tl.constexpr = C_IN
+    W_KH: tl.constexpr = 3 * C_IN
+    W_CO: tl.constexpr = 9 * C_IN
+
+    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
+    om = m_mask[:, None] & n_mask[None, :]
+
+    ag_mask = tl.load(ag_mask_ptr + tile_id)
+
+    if ag_mask == 0:
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        if HAS_BN:
+            acc = acc * tl.load(bn_scale_ptr + offs_n, mask=n_mask, other=1.0)[None, :] \
+                + tl.load(bn_bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        if SKIP_LIF:
+            tl.store(spike_ptr + oa, acc, mask=om)
+        vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+        vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
+        sp = (vt >= V_TH).to(tl.float32)
+        if HAS_V_RESET:
+            v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
+            vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+        else:
+            vn = vt - sp * V_TH
+        tl.store(spike_ptr + oa, sp, mask=om)
+        tl.store(v_next_ptr + oa, vn, mask=om)
+        return
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for g in range(NUM_GROUPS):
+        g_active = (ag_mask >> g) & 1
+        cin_start = g * GROUP_SIZE_C
+        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+        k_mask = (g_active != 0) & (offs_k < C_IN)
+
+        for kh in tl.static_range(3):
+            for kw in tl.static_range(3):
+                in_h = out_h + (kh - 1)
+                in_w = out_w + (kw - 1)
+                h_ok = (in_h >= 0) & (in_h < H)
+                w_ok = (in_w >= 0) & (in_w < W)
+                safe_h = tl.minimum(tl.maximum(in_h, 0), H - 1)
+                safe_w = tl.minimum(tl.maximum(in_w, 0), W - 1)
+                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW + safe_h[:, None] * W + safe_w[:, None]
+                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                acc += tl.dot(x_tile, w_tile)
+
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+    if HAS_BN:
+        acc = acc * tl.load(bn_scale_ptr + offs_n, mask=n_mask, other=1.0)[None, :] \
+            + tl.load(bn_bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+
+    if SKIP_LIF:
+        om = m_mask[:, None] & n_mask[None, :]
+        tl.store(spike_ptr + oa, acc, mask=om)
+        return
+    vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+    vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
+    sp = (vt >= V_TH).to(tl.float32)
+    if HAS_V_RESET:
+        v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
+        vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+    else:
+        vn = vt - sp * V_TH
+    tl.store(spike_ptr + oa, sp, mask=om)
+    tl.store(v_next_ptr + oa, vn, mask=om)
+
+
+# ===================================================================
+# Python entry point
+# ===================================================================
+
+def sparse_fused_conv_bn_lif_forward(
+    x,
+    v_prev,
+    weight,
+    bias,
+    bn_scale=None,
+    bn_bias=None,
+    tau=2.0,
+    v_threshold=1.0,
+    v_reset=0.0,
+    decay_input=True,
+    block_size=None,
+    kernel_size=3,
+    threshold=1e-6,
+    w_cl=None,
+    ag_mask_buf=None,
+    return_ms=False,
+    fallback_ratio=FALLBACK_RATIO,
+    return_avg_active_ratio=False,
+    skip_lif=False,
+    **legacy_kwargs,
+):
+    global _LEGACY_ARGS_WARNED
+    import torch.nn.functional as Fn
+
+    if legacy_kwargs:
+        # Backward compatibility shim for old call sites.
+        # Supported old key for buffer reuse: ag_count_buf -> ag_mask_buf.
+        legacy_ag_count_buf = legacy_kwargs.get("ag_count_buf", None)
+        if ag_mask_buf is None and legacy_ag_count_buf is not None:
+            ag_mask_buf = legacy_ag_count_buf
+        if not _LEGACY_ARGS_WARNED:
+            warnings.warn(
+                "[SparseFlow] sparse_fused_conv_lif_forward legacy arguments are deprecated and ignored. "
+                "Please pass ag_mask_buf only.",
+                UserWarning,
+            )
+            _LEGACY_ARGS_WARNED = True
+
+    N, C_IN, H, W = x.shape
+    C_OUT = weight.shape[0]
+    device = x.device
+    spike_dtype = x.dtype
+
+    stride = 1
+    padding = 1 if kernel_size == 3 else 0
+    H_OUT = (H + 2 * padding - kernel_size) // stride + 1
+    W_OUT = (W + 2 * padding - kernel_size) // stride + 1
+
+    GROUP_SIZE_C = choose_group_size(C_IN)
+    NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
+
+    BH, BW = _select_tile_sizes(H_OUT, W_OUT)
+    GH = triton.cdiv(H_OUT, BH)
+    GW = triton.cdiv(W_OUT, BW)
+    N_TILES = N * GH * GW
+
+    # 1x1 or unsupported → dense fallback with BN+LIF
+    if kernel_size != 3:
+        y = Fn.conv2d(x, weight, bias, stride=1, padding=0)
+        if bn_scale is not None:
+            y = y * bn_scale.view(1, -1, 1, 1) + bn_bias.view(1, -1, 1, 1)
+        if skip_lif:
+            if return_avg_active_ratio:
+                return y, torch.zeros_like(y), 0.0, 1.0
+            return y, torch.zeros_like(y), 0.0
+        vp = v_prev.to(dtype=y.dtype)
+        if decay_input:
+            vt = vp + (y - (vp - (0.0 if v_reset is None else float(v_reset)))) / float(tau)
+        else:
+            vt = vp - (vp - (0.0 if v_reset is None else float(v_reset))) / float(tau) + y
+        sp = (vt >= v_threshold).to(dtype=vt.dtype)
+        if v_reset is None:
+            vn = vt - sp * v_threshold
+        else:
+            vn = torch.where(sp.bool(), torch.full_like(vt, float(v_reset)), vt)
+        if return_avg_active_ratio:
+            return sp, vn, 0.0, 1.0
+        return sp, vn, 0.0
+
+    x_f16 = x.half().contiguous()
+
+    if ag_mask_buf is None:
+        ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+
+    _build_two_stage_metadata(
+        x_f16, N, C_IN, H, W, H_OUT, W_OUT,
+        BH, BW, GH, GW,
+        kernel_size, stride, padding, threshold,
+        ag_mask_buf, None,
+    )
+
+    avg_active_ratio = None
+    if return_avg_active_ratio:
+        # Vectorized SWAR popcount (no Python loop)
+        v = ag_mask_buf[:N_TILES].int()
+        v = v - ((v >> 1) & 0x55555555)
+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
+        v = (v + (v >> 4)) & 0x0F0F0F0F
+        v = v + (v >> 8)
+        v = v + (v >> 16)
+        pc = (v & 0x3F).to(torch.int32)
+        avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
+
+    if ENABLE_RUNTIME_FALLBACK_POLICY and (
+        (avg_active_ratio is not None and avg_active_ratio > fallback_ratio)
+        or (
+            avg_active_ratio is None
+            and _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio)
+        )
+    ):
+        y = Fn.conv2d(x, weight, bias, stride=1, padding=1)
+        if bn_scale is not None:
+            y = y * bn_scale.view(1, -1, 1, 1) + bn_bias.view(1, -1, 1, 1)
+        vp = v_prev.to(dtype=y.dtype)
+        if decay_input:
+            vt = vp + (y - (vp - (0.0 if v_reset is None else float(v_reset)))) / float(tau)
+        else:
+            vt = vp - (vp - (0.0 if v_reset is None else float(v_reset))) / float(tau) + y
+        sp = (vt >= v_threshold).to(dtype=vt.dtype)
+        if v_reset is None:
+            vn = vt - sp * v_threshold
+        else:
+            vn = torch.where(sp.bool(), torch.full_like(vt, float(v_reset)), vt)
+        if return_avg_active_ratio:
+            return sp, vn, 0.0, avg_active_ratio
+        return sp, vn, 0.0
+
+    if w_cl is not None:
+        w_cl_f16 = w_cl
+    else:
+        w_cl_f16 = weight.half().permute(0, 2, 3, 1).contiguous()
+
+    has_bias = bias is not None
+    has_bn = bn_scale is not None
+    spike_out = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=spike_dtype, device=device)
+    v_next = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    v_prev_f32 = v_prev.float().contiguous()
+    bias_arg = (
+        bias.detach().to(spike_out.dtype).contiguous() if has_bias
+        else torch.empty(1, dtype=spike_out.dtype, device=device)
+    )
+    bn_scale_arg = (
+        bn_scale.detach().float().contiguous() if has_bn
+        else torch.empty(1, dtype=torch.float32, device=device)
+    )
+    bn_bias_arg = (
+        bn_bias.detach().float().contiguous() if has_bn
+        else torch.empty(1, dtype=torch.float32, device=device)
+    )
+
+    sparse_ms = 0.0
+    if return_ms:
+        se = torch.cuda.Event(enable_timing=True)
+        ee = torch.cuda.Event(enable_timing=True)
+        se.record()
+
+    def _grid(META):
+        return (N_TILES, triton.cdiv(C_OUT, META["BLOCK_N"]))
+
+    decay = 1.0 - 1.0 / float(tau)
+    recip_tau = 1.0 / float(tau)
+    has_v_reset = v_reset is not None
+    v_reset_val = 0.0 if v_reset is None else float(v_reset)
+
+    kernel = fused_bm_conv3x3_bn_lif_8x16 if BW == 16 else fused_bm_conv3x3_bn_lif_8x8
+    kernel[_grid](
+        x_f16,
+        w_cl_f16,
+        bias_arg,
+        bn_scale_arg,
+        bn_bias_arg,
+        ag_mask_buf,
+        v_prev_f32,
+        spike_out,
+        v_next,
+        N,
+        C_IN, C_OUT, H_OUT, W_OUT, GH, GW,
+        HAS_BIAS=has_bias,
+        HAS_BN=has_bn,
+        SKIP_LIF=skip_lif,
+        DECAY=decay,
+        RECIP_TAU=recip_tau,
+        V_TH=float(v_threshold),
+        HAS_V_RESET=has_v_reset,
+        V_RESET=v_reset_val,
+        GROUP_SIZE_C=GROUP_SIZE_C,
+        NUM_GROUPS=NUM_GROUPS,
+    )
+
+    if return_ms:
+        ee.record()
+        torch.cuda.synchronize(device)
+        sparse_ms = se.elapsed_time(ee)
+
+    if return_avg_active_ratio:
+        return spike_out, v_next, sparse_ms, avg_active_ratio
+    return spike_out, v_next, sparse_ms

@@ -1,0 +1,263 @@
+"""
+CATFuse-SF spatio-temporal policy engine.
+
+For each fusible pattern (Conv→BN→LIF, Add→LIF, Linear→LIF, etc.),
+this module decides:
+
+  1. Temporal parameters:  K (TimeBlock size), fusion mode
+  2. Spatial backend:      DenseKeep / SparseFlow / StaticZero
+
+Temporal decisions use the I/O analytical formula from CTF §3.9.
+Spatial decisions use SparseFlow's execution-grounded dispatch (EGD).
+
+The policy table is static per (pattern, shape_regime) pair.
+Spatial backend selection may additionally be per-invocation at runtime
+via SparseFlow's prescan + dispatch, with no host-device sync on the
+hot path.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+
+# ============================================================
+# Spatial backend enum
+# ============================================================
+
+class SpatialBackend:
+    DENSE_KEEP = "DenseKeep"       # cuDNN Conv (partial fusion)
+    SPARSE_FLOW = "SparseFlow"     # prescan + sparse Conv (full fusion)
+    STATIC_ZERO = "StaticZero"     # skip Conv, output bias-only
+
+
+# ============================================================
+# Policy row
+# ============================================================
+
+@dataclass
+class PolicyRow:
+    """One row of the spatio-temporal policy table."""
+    pattern: str                    # e.g. "Conv3x3_BN_LIF"
+    shape_regime: str               # "compute_bound" or "memory_bound"
+    K: int                          # TimeBlock size
+    spatial_backend: str            # SpatialBackend value
+    fusion_mode: str                # "full_triton" or "partial_cudnn"
+    io_ratio: Optional[float] = None  # analytical I/O ratio vs reference
+
+    def __repr__(self):
+        return (f"PolicyRow({self.pattern}, {self.shape_regime}, "
+                f"K={self.K}, spatial={self.spatial_backend}, "
+                f"fusion={self.fusion_mode}, io={self.io_ratio})")
+
+
+# ============================================================
+# I/O cost model from CTF §3.9
+# ============================================================
+
+def io_ratio_partial_fusion(K: int) -> float:
+    """I/O ratio for partial fusion (cuDNN Conv + Triton BN+LIF tail).
+
+    Path A: DenseKeep.
+    z goes to HBM (cuDNN writes, Triton reads).
+    Formula: (3 + 2/K) / 7
+    """
+    return (3.0 + 2.0 / K) / 7.0
+
+
+def io_ratio_full_fusion(K: int) -> float:
+    """I/O ratio for full fusion (Triton Conv+BN+LIF or SparseFlow+BN+LIF).
+
+    Path B: SparseFlow or full Triton dense.
+    z stays on-chip (StreamFuse).
+    Formula: (1 + 2/K) / 5
+    """
+    return (1.0 + 2.0 / K) / 5.0
+
+
+def optimal_K(T: int, regime: str = "memory_bound") -> int:
+    """Select optimal K for a given T and shape regime.
+
+    For memory-bound layers, larger K = more I/O savings (diminishing returns).
+    For compute-bound layers with cuDNN fallback, K mainly affects StateCarry
+    overhead which is minor -> K=4 is a practical sweet spot.
+
+    Returns a power-of-2 K in [1, T].
+    """
+    if regime == "compute_bound":
+        return min(4, T)
+    # memory_bound: K=4 captures ~85% of max savings, K=8 captures ~92%
+    return min(8, T)
+
+
+# ============================================================
+# Shape regime classifier
+# ============================================================
+
+def classify_shape_regime(
+    C_in: int, C_out: int, H: int, W: int, kernel_size: int = 3
+) -> str:
+    """Classify a Conv layer as compute-bound or memory-bound.
+
+    Heuristic based on test_17 lean-path empirical data (V100):
+    - SF wins cuDNN at C>=256, H<=14 (layer3/layer4)
+    - cuDNN wins at C<=128 regardless of spatial size
+    - Mixed regime defaults to compute_bound (cuDNN, safer)
+    """
+    if kernel_size == 1:
+        return "memory_bound"  # 1x1 conv is always memory-bound territory
+    if C_in >= 256 and H <= 14:
+        return "memory_bound"  # SF wins here (1.1-1.7x over cuDNN)
+    if C_in <= 128:
+        return "compute_bound"  # cuDNN always wins at low channels
+    # C_in >= 256 but H > 14: cuDNN still likely wins
+    if H >= 28:
+        return "compute_bound"
+    return "memory_bound"
+
+
+# ============================================================
+# Default policy table
+# ============================================================
+
+def build_default_policy_table():
+    """Build the default spatio-temporal policy table.
+
+    This encodes the decisions from CATFuse Phase 0-2 data plus
+    SparseFlow's spatial backend routing.
+    """
+    table = {}
+
+    # Conv 3x3 -> BN -> LIF
+    table[("Conv3x3_BN_LIF", "compute_bound")] = PolicyRow(
+        pattern="Conv3x3_BN_LIF",
+        shape_regime="compute_bound",
+        K=4,
+        spatial_backend=SpatialBackend.DENSE_KEEP,
+        fusion_mode="partial_cudnn",
+        io_ratio=io_ratio_partial_fusion(4),
+    )
+    table[("Conv3x3_BN_LIF", "memory_bound")] = PolicyRow(
+        pattern="Conv3x3_BN_LIF",
+        shape_regime="memory_bound",
+        K=8,
+        spatial_backend=SpatialBackend.SPARSE_FLOW,  # runtime dispatch
+        fusion_mode="full_triton",
+        io_ratio=io_ratio_full_fusion(8),
+    )
+
+    # Conv 1x1 -> LIF
+    table[("Conv1x1_LIF", "memory_bound")] = PolicyRow(
+        pattern="Conv1x1_LIF",
+        shape_regime="memory_bound",
+        K=8,
+        spatial_backend=SpatialBackend.SPARSE_FLOW,
+        fusion_mode="full_triton",
+        io_ratio=io_ratio_full_fusion(8),
+    )
+
+    # Linear -> LIF
+    table[("Linear_LIF", "all")] = PolicyRow(
+        pattern="Linear_LIF",
+        shape_regime="all",
+        K=0,  # K=T (full temporal fusion)
+        spatial_backend=SpatialBackend.DENSE_KEEP,
+        fusion_mode="full_triton",
+        io_ratio=None,
+    )
+
+    # Add -> LIF
+    table[("Add_LIF", "all")] = PolicyRow(
+        pattern="Add_LIF",
+        shape_regime="all",
+        K=0,
+        spatial_backend=SpatialBackend.DENSE_KEEP,
+        fusion_mode="full_triton",
+        io_ratio=None,
+    )
+
+    # Add -> BN -> LIF
+    table[("Add_BN_LIF", "all")] = PolicyRow(
+        pattern="Add_BN_LIF",
+        shape_regime="all",
+        K=0,
+        spatial_backend=SpatialBackend.DENSE_KEEP,
+        fusion_mode="full_triton",
+        io_ratio=None,
+    )
+
+    # AvgPool -> LIF
+    table[("AvgPool_LIF", "all")] = PolicyRow(
+        pattern="AvgPool_LIF",
+        shape_regime="all",
+        K=0,
+        spatial_backend=SpatialBackend.DENSE_KEEP,
+        fusion_mode="full_triton",
+        io_ratio=None,
+    )
+
+    return table
+
+
+# ============================================================
+# Policy lookup
+# ============================================================
+
+_DEFAULT_TABLE = None
+
+
+def get_policy(
+    pattern: str,
+    C_in: int = 0,
+    C_out: int = 0,
+    H: int = 0,
+    W: int = 0,
+    kernel_size: int = 3,
+    T: int = 16,
+) -> PolicyRow:
+    """Look up the policy for a given pattern and shape.
+
+    Args:
+        pattern: one of "Conv3x3_BN_LIF", "Conv1x1_LIF", "Linear_LIF",
+                 "Add_LIF", "Add_BN_LIF", "AvgPool_LIF"
+        C_in, C_out, H, W: layer shape (for Conv patterns)
+        kernel_size: convolution kernel size
+        T: total time steps
+
+    Returns:
+        PolicyRow with (K, spatial_backend, fusion_mode, io_ratio)
+    """
+    global _DEFAULT_TABLE
+    if _DEFAULT_TABLE is None:
+        _DEFAULT_TABLE = build_default_policy_table()
+
+    # Classify shape regime
+    if pattern in ("Linear_LIF", "Add_LIF", "Add_BN_LIF", "AvgPool_LIF"):
+        regime = "all"
+    else:
+        regime = classify_shape_regime(C_in, C_out, H, W, kernel_size)
+
+    key = (pattern, regime)
+    if key in _DEFAULT_TABLE:
+        row = _DEFAULT_TABLE[key]
+        # K=0 means K=T
+        if row.K == 0:
+            row = PolicyRow(
+                pattern=row.pattern,
+                shape_regime=row.shape_regime,
+                K=T,
+                spatial_backend=row.spatial_backend,
+                fusion_mode=row.fusion_mode,
+                io_ratio=row.io_ratio,
+            )
+        return row
+
+    # Fallback: conservative partial fusion
+    return PolicyRow(
+        pattern=pattern,
+        shape_regime=regime,
+        K=min(4, T),
+        spatial_backend=SpatialBackend.DENSE_KEEP,
+        fusion_mode="partial_cudnn",
+        io_ratio=io_ratio_partial_fusion(min(4, T)),
+    )
