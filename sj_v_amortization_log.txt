@@ -1,0 +1,20 @@
+/data/anaconda3/envs/snn118/lib/python3.9/site-packages/torch/nn/modules/conv.py:456: UserWarning: Applied workaround for CuDNN issue, install nvrtc.so (Triggered internally at ../aten/src/ATen/native/cudnn/Conv_v8.cpp:80.)
+  return F.conv2d(input, weight, bias, self.stride,
+---- memory_stats summary ----
+allocated_bytes.peak:        915.54 MB
+allocated_bytes.allocated:   4910.29 MB
+allocation.allocated:        354 events
+
+---- 理论参考 ----
+|step| = 4.19 MB
+T·|step| = 67.11 MB
+
+H₀ 预测 (v in register, 5T ledger):
+  per-step v HBM流量 ≈ 2/T·|step| ≈ 0.524 MB
+  per-forward v 总 HBM 流量 ≈ 2·|step| = 8.39 MB
+  per-forward 总 ledger ≈ 5T·|step| = 335.54 MB
+
+H₁ 预测 (v 每步落 HBM, 7T ledger):
+  per-step v HBM流量 = 2·|step| = 8.39 MB
+  per-forward v 总 HBM 流量 = 2T·|step| = 134.22 MB
+  per-forward 总 ledger ≈ 7T·|step| = 469.76 MB
