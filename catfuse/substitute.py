@@ -558,14 +558,13 @@ def substitute_sf(sj_model, T=16, verbose=False, force_sparse=False):
 
                         # Linear + BN1d + LIF
                         elif isinstance(c, nn.Linear) and isinstance(b, nn.BatchNorm1d):
-                            fused = FusedLinearLIF.from_sj_modules(c, l)
-                            pattern_name = "FusedLinearLIF"
-
-                            setattr(parent_mod, base, fused)
-                            bn_attr = base + '_bn'
-                            lif_attr = base + '_lif' if hasattr(parent_mod, base + '_lif') else base + '_sn'
-                            setattr(parent_mod, bn_attr, nn.Identity())
-                            setattr(parent_mod, lif_attr, nn.Identity())
+                            import warnings
+                            warnings.warn(
+                                f"CATFuse: Linear+BN1d+LIF at {full_name}: BN1d is NOT absorbed into FusedLinearLIF. "
+                                f"This path drops BN1d semantics. Skipping this pattern to preserve correctness.",
+                                RuntimeWarning, stacklevel=2)
+                            # Do NOT replace — skip to preserve BN1d semantics
+                            continue
 
                             replacements_done.add(id(l))
                             stats["fused_lif_nodes"] += 1
@@ -633,14 +632,13 @@ def substitute_sf(sj_model, T=16, verbose=False, force_sparse=False):
 
                         # Linear + BN1d + LIF
                         elif isinstance(c, nn.Linear) and isinstance(b, nn.BatchNorm1d):
-                            fused = FusedLinearLIF.from_sj_modules(c, l)
-                            pattern_name = "FusedLinearLIF"
-
-                            setattr(parent_mod, base, fused)
-                            bn_attr = base + '_bn'
-                            lif_attr = base + '_lif' if hasattr(parent_mod, base + '_lif') else base + '_sn'
-                            setattr(parent_mod, bn_attr, nn.Identity())
-                            setattr(parent_mod, lif_attr, nn.Identity())
+                            import warnings
+                            warnings.warn(
+                                f"CATFuse: Linear+BN1d+LIF at {full_name}: BN1d is NOT absorbed into FusedLinearLIF. "
+                                f"This path drops BN1d semantics. Skipping this pattern to preserve correctness.",
+                                RuntimeWarning, stacklevel=2)
+                            # Do NOT replace — skip to preserve BN1d semantics
+                            continue
 
                             replacements_done.add(id(l))
                             stats["fused_lif_nodes"] += 1

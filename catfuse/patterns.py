@@ -187,6 +187,7 @@ class PartialFusionConvLIF(CTFPattern):
             torch.empty(out_channels, in_channels, kernel_size, kernel_size)
         )
         nn.init.kaiming_normal_(self.weight)
+        self.conv_bias = None  # Conv bias (may be None for bias=False)
         self.step_mode = "m"  # Tell SJ to pass full [T,B,C,H,W] in multi-step mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -302,8 +303,10 @@ class PartialFusionConvBNLIF(CTFPattern):
                 scale = self.bn_weight * inv_std  # [C_out]
                 # Fold scale into conv weight: w_fused[co,ci,kh,kw] = w[co,ci,kh,kw] * scale[co]
                 self._w_fused = (self.weight * scale.view(-1, 1, 1, 1)).detach()
-                # Fold bias: b_fused = bn_bias - running_mean * scale
+                # Fold bias: b_fused = bn_bias - running_mean * scale + conv_bias * scale
                 self._b_fused = (self.bn_bias - self.running_mean * scale).detach()
+                if getattr(self, 'conv_bias', None) is not None:
+                    self._b_fused = self._b_fused + (self.conv_bias * scale).detach()
 
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         """Core forward: x is [T, B, C_in, H, W]."""
@@ -383,8 +386,10 @@ class PartialFusionConvBNLIF(CTFPattern):
             tau=tau, v_threshold=v_th, v_reset=v_reset,
             bn_eps=sj_bn.eps,
         )
-        # Copy conv weight
+        # Copy conv weight + optional bias
         inst.weight.data.copy_(sj_conv.weight.data)
+        if sj_conv.bias is not None:
+            inst.conv_bias = sj_conv.bias.data.clone()
         # Copy BN params (SJ BN has gamma, beta, running_mean, running_var)
         inst.bn_weight.data.copy_(sj_bn.weight.data)
         inst.bn_bias.data.copy_(sj_bn.bias.data)
