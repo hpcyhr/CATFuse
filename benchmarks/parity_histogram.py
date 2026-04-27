@@ -34,7 +34,7 @@ from spikingjelly.activation_based import functional, neuron, surrogate, layer a
 _DIR = os.path.dirname(os.path.abspath(__file__))
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
-from catfuse_patterns import PartialFusionConvBNLIF
+from catfuse.patterns import PartialFusionConvBNLIF
 
 
 def main():

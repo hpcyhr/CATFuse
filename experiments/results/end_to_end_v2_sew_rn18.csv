@@ -1,0 +1,13 @@
+impl,B,T,wall_us_median,pointwise_max_diff,spike_flip_rate_max,spike_flip_rate_mean,classifier_agreement,notes
+SJ-eager,1,4,10565.285789780319,0.0,0.0,0.0,1.0,"reference, ckpt: loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,1,4,7087.082508951426,0.0,0.0,0.0,1.0,DenseKeep-only (SF disabled at impl level)
+CATFuse-default,1,4,11137.278187088668,0.24268245697021484,0.0,0.0,1.0,Runtime EGD routing (SF on layers with sparsity>0.7)
+SJ-eager,2,4,12459.784941747785,0.0,0.0,0.0,1.0,"reference, ckpt: loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,2,4,7407.698160968721,0.0,0.0,0.0,1.0,DenseKeep-only (SF disabled at impl level)
+CATFuse-default,2,4,11348.592997528613,0.6468462944030762,0.0,0.0,1.0,Runtime EGD routing (SF on layers with sparsity>0.7)
+SJ-eager,8,4,13575.294660404325,0.0,0.0,0.0,1.0,"reference, ckpt: loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,8,4,8229.913990944624,0.26267147064208984,0.0,0.0,1.0,DenseKeep-only (SF disabled at impl level)
+CATFuse-default,8,4,12539.77911081165,0.6125407218933105,0.0,0.0,1.0,Runtime EGD routing (SF on layers with sparsity>0.7)
+SJ-eager,32,4,17505.767988041043,0.0,0.0,0.0,1.0,"reference, ckpt: loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,32,4,14882.69664812833,0.9847636222839355,0.0,0.0,1.0,DenseKeep-only (SF disabled at impl level)
+CATFuse-default,32,4,28412.617868743837,1.0415611267089844,0.0,0.0,1.0,Runtime EGD routing (SF on layers with sparsity>0.7)

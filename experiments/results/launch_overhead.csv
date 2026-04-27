@@ -1,0 +1,10 @@
+kernel,launches_per_call,wall_us_median,wall_us_per_launch,description
+empty,1,18.577918875962496,18.577918875962496,empty Triton kernel (pure launch overhead)
+empty,4,71.88685005530715,17.971712513826787,empty Triton kernel (pure launch overhead)
+empty,8,142.5562067888677,17.819525848608464,empty Triton kernel (pure launch overhead)
+trivial,1,22.87131827324629,22.87131827324629,"trivial 1-load-1-store Triton kernel, BLOCK=16"
+trivial,4,88.40415999293327,22.10103999823332,"trivial 1-load-1-store Triton kernel, BLOCK=16"
+trivial,8,175.71999924257398,21.964999905321747,"trivial 1-load-1-store Triton kernel, BLOCK=16"
+sf_streamfuse_K=1,4,1244.4862080737948,311.1215520184487,"SparseFlow Triton kernel on layer3 shape, K=1"
+sf_streamfuse_K=2,2,1000.0083497725427,500.00417488627136,"SparseFlow Triton kernel on layer3 shape, K=2"
+sf_streamfuse_K=4,1,828.4650812856853,828.4650812856853,"SparseFlow Triton kernel on layer3 shape, K=4"

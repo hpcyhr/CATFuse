@@ -1,6 +1,17 @@
 """
 Test 30: K-sweep + HBM analytic formula validation (§3.9)
 
+[Stage 8 note] This test predates the Stage 3-6 Implementation hierarchy.
+Its `hybrid_fn` benchmark uses an INLINE Python loop for the LIF dynamics
+rather than the production lif_sequential Triton kernel — so its wall-clock
+numbers reflect "what if LIF were inline Python", NOT actual deployment
+performance of PartialFusionConvBNLIF / STFusionConvBNLIF.
+
+Kept for historical record. For the deployment-correct K-sweep targeting
+§3.10 paper data, use tests/test_30b_k_sweep_real.py — it goes through
+SparseFlow.forward_with_k (Stage 6) and DenseKeep.forward (Stage 3) using
+the same kernels SEW-RN18 actually runs in production.
+
 For a single Conv+BN+LIF layer:
   1. Compute analytic HBM bytes for reference and CTF at each K
   2. Measure wall-clock at each K
@@ -9,7 +20,9 @@ For a single Conv+BN+LIF layer:
 Three execution modes:
   - REF: SpikingJelly per-step Conv→BN→LIF (baseline)
   - CTF-Dense: PartialFusionConvBNLIF (cuDNN + fused BN+LIF)
+                BUT: hybrid_fn uses inline Python LIF, NOT lif_sequential
   - CTF-SF: StreamFuse kernel (z stays in registers)
+                this one IS realistic — calls sparse_streamfuse_conv3x3_bn_lif
 """
 import sys, time, statistics
 sys.path.insert(0, '.')

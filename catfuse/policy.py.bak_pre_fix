@@ -121,15 +121,7 @@ def classify_shape_regime(
     sf_C = hwprof.sf_threshold_C
     sf_H = hwprof.sf_threshold_H
     if kernel_size == 1:
-        return "memory_bound"  # 1x1 conv is always memory-bound territory
-    if C_in >= sf_C and H <= sf_H:
-        return "memory_bound"  # SF wins here (1.1-1.7x over cuDNN on V100)
-    if C_in <= sf_C // 2:
-        return "compute_bound"  # cuDNN always wins at low channels
-    # C_in >= sf_C but H > sf_H: cuDNN still likely wins
-    if H >= sf_H * 2:
-        return "compute_bound"
-    return "memory_bound"
+        return "memory_bound"
 
 
 # ============================================================

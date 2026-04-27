@@ -2,7 +2,7 @@
 catfuse.substitute — CTF substitute mechanism (Phase 3 task 3.2)
 
 Scans a SpikingJelly nn.Module, identifies CTF-fusible patterns, and
-replaces matched subgraphs with instances from catfuse_patterns.
+replaces matched subgraphs with instances from catfus.patterns.
 
 Current support:
   - VGG-style Sequential patterns (SpikingVGG11_bn features, classifier)

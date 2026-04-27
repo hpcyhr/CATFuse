@@ -1,0 +1,4 @@
+impl,n_total,n_correct,accuracy,n_agree_with_sj,agreement_with_sj,notes
+SJ-eager,10000,6310,0.631,10000,1.0,reference
+CATFuse-DK,10000,6309,0.6309,9991,0.9991,DenseKeep-only
+CATFuse-default,10000,6306,0.6306,9931,0.9931,Runtime EGD routing

@@ -41,6 +41,11 @@ try:
 except ImportError:
     _SJ_MEMORY_MODULE = nn.Module
 
+# Stage 2 refactor: STFusion now inherits from CTFPattern so it shares the
+# unified StateBuffer-based reset() protocol with all other CTF patterns.
+from catfuse.patterns import CTFPattern
+from catfuse.state import StateBuffer
+
 try:
     from catfuse.sparseflow.fused_conv_bn_lif_kernel import (
         sparse_fused_conv_bn_lif_forward,
@@ -83,7 +88,7 @@ def _fold_bn_params(bn: nn.BatchNorm2d):
     return scale.detach(), offset.detach()
 
 
-class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
+class STFusionConvBNLIF(CTFPattern):
     """Spatio-temporal fused Conv→BN→LIF with SparseFlow spatial backend.
 
     Attributes:
@@ -93,6 +98,7 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
         bn_scale: folded BN scale [C_out]
         bn_bias: folded BN bias [C_out]
         tau, v_threshold, v_reset: LIF parameters
+        state: StateBuffer holding membrane potential (Stage 2 refactor)
     """
 
     policy_row = "STFusionConvBNLIF"
@@ -152,16 +158,76 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
         # Precomputed weight layout for SparseFlow kernel (channel-last for 3x3)
         self._w_cl: Optional[torch.Tensor] = None
 
-        # Membrane potential state
-        self.register_memory('v', 0.0)
+        # Membrane potential state via StateBuffer (Stage 2 refactor:
+        # replaces register_memory('v', 0.0)). Reset is handled by the
+        # CTFPattern base class.
+        self.state = StateBuffer()
+        self._register_state(self.state)
 
         # Prescan buffer (reusable across steps)
         self._ag_mask_buf: Optional[torch.Tensor] = None
         self._tile_class_buf: Optional[torch.Tensor] = None
 
         # Lean path cached state (initialized on first forward)
+        # Stage 3 refactor note: _lean_cache and _lean_forward_single are now
+        # unused by the main forward path (lean batchfold goes through
+        # SparseFlow Implementation). The fields are kept to avoid breaking
+        # any external code that may reach into them; a future stage will
+        # remove them.
         self._lean_ready = False
         self._lean_cache = {}
+
+        # ---- Stage 3 refactor: Implementation hierarchy --------------
+        # Build static spec + impls. ConvLIFParams is built lazily because
+        # buffers (bn_scale, bn_bias_folded) may move via .to(device) and
+        # we want params to follow.
+        from catfuse.implementations import (
+            ConvLIFSpec, DenseKeep, SparseFlow as _SparseFlow,
+        )
+        self.spec = ConvLIFSpec(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            has_conv_bias=(bias is True),
+            has_bn=(bn_scale is not None),
+            tau=float(tau),
+            v_threshold=float(v_threshold),
+            v_reset=v_reset,
+            decay_input=bool(decay_input),
+        )
+        self._impl_dense = DenseKeep()
+        # SparseFlow may be unavailable on environments without Triton kernels;
+        # in that case self._impl_sparse is None and dispatch falls back to
+        # _impl_dense unconditionally.
+        self._impl_sparse = _SparseFlow() if _SparseFlow is not None else None
+        self._params = None        # type: ignore[assignment]
+        self._params_key = None    # type: ignore[assignment]
+
+    def _ensure_params(self):
+        """Lazily build ConvLIFParams from current weight/bias/bn buffers.
+
+        Cached by identity of the source tensors; identity changes on
+        .to(device) for buffers, so cache auto-invalidates.
+        """
+        key = (
+            id(self.weight),
+            id(self.bias),
+            id(self.bn_scale),
+            id(self.bn_bias_folded),
+        )
+        if self._params_key == key and self._params is not None:
+            return self._params
+        from catfuse.implementations import ConvLIFParams
+        self._params = ConvLIFParams(
+            weight=self.weight,
+            bias=self.bias,
+            bn_scale=self.bn_scale,
+            bn_bias=self.bn_bias_folded,
+        )
+        self._params_key = key
+        return self._params
 
     def _ensure_w_cl(self):
         """Precompute channel-last weight layout for SparseFlow kernel."""
@@ -383,41 +449,14 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
         """DenseKeep fallback: cuDNN conv + BN + LIF (no sparse kernel).
 
         Used by Runtime EGD when sparsity is too low for StreamFuse to win.
-        Same as PartialFusionConvBNLIF: BatchFold conv + lif_sequential.
+
+        Stage 3 refactor: delegates to self._impl_dense (DenseKeep), which
+        is the canonical bit-exact realization shared with PartialFusionConvBNLIF.
+        Removes ~30 lines of inline conv+lif math previously duplicated here.
         """
-        T, B = x.shape[0], x.shape[1]
-        c = self._lean_cache
-        device = x.device
-        H_out, W_out = c['H_out'], c['W_out']
-
-        # 1. BatchFold + cuDNN conv with folded BN
-        x_4d = x.reshape(T * B, self.in_channels, x.shape[3], x.shape[4])
-        if not hasattr(self, '_w_conv_fused') or self._w_conv_fused is None:
-            with torch.no_grad():
-                if self.bn_scale is not None:
-                    scale = self.bn_scale
-                    bias = self.bn_bias_folded
-                    self._w_conv_fused = (self.weight * scale.view(-1, 1, 1, 1)).detach()
-                    self._b_conv_fused = bias.detach() if bias is not None else None
-                else:
-                    self._w_conv_fused = self.weight.detach()
-                    self._b_conv_fused = (self.bias.detach() if self.bias is not None else None)
-
-        z_4d = torch.nn.functional.conv2d(
-            x_4d, self._w_conv_fused, bias=self._b_conv_fused,
-            stride=self.stride, padding=self.padding,
+        return self._impl_dense.forward(
+            x, self.spec, self._ensure_params(), self.state,
         )
-        z = z_4d.reshape(T, B, self.out_channels, H_out, W_out)
-
-        # 2. LIF
-        v_init = self.v if isinstance(self.v, torch.Tensor) else torch.zeros(
-            B, self.out_channels, H_out, W_out, dtype=torch.float32, device=device)
-        spikes, v_final = lif_sequential(
-            z, v_init, tau=self.tau,
-            v_threshold=self.v_threshold, v_reset=self.v_reset,
-        )
-        self.v = v_final
-        return spikes
 
     def _batchfold_forward(self, x):
         """StreamFuse: Conv+BN+LIF over T steps in ONE kernel launch.
@@ -425,88 +464,21 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
         z stays in registers (never hits HBM).
         v stays in registers across T steps.
         Inline zero-detection replaces separate prescan.
+
+        Stage 3 refactor: delegates to self._impl_sparse (SparseFlow), which
+        owns the lean kernel cache (_w_cl, _ag_mask_buf, etc.) and handles
+        the static-zero short-circuit internally. If SparseFlow is unavailable
+        on this platform (no Triton), falls back to DenseKeep — Corollary 3.17
+        guarantees bit-exact equivalence.
         """
-        T, B = x.shape[0], x.shape[1]
-        c = self._lean_cache
-        device = x.device
-        H_out, W_out = c['H_out'], c['W_out']
-
-        # Flatten to [T*B, C_in, H, W]
-        x_flat = x.reshape(T * B, self.in_channels, x.shape[3], x.shape[4])
-
-        # StaticZero: if entire batch is zero, skip conv kernel launch
-        if not x_flat.any():
-            H_out, W_out = c['H_out'], c['W_out']
-            # z = BN bias only
-            if c['has_bn']:
-                z_flat = c['bn_bias_arg'].view(1, -1, 1, 1).expand(
-                    T * B, self.out_channels, H_out, W_out).clone()
-            elif c['has_bias']:
-                z_flat = c['bias_arg'].view(1, -1, 1, 1).expand(
-                    T * B, self.out_channels, H_out, W_out).clone()
-            else:
-                z_flat = torch.zeros(T * B, self.out_channels, H_out, W_out,
-                                     dtype=torch.float32, device=device)
-            z = z_flat.reshape(T, B, self.out_channels, H_out, W_out)
-            v_init = self.v if isinstance(self.v, torch.Tensor) else torch.zeros(
-                B, self.out_channels, H_out, W_out, dtype=torch.float32, device=device)
-            spikes, v_final = lif_sequential(
-                z, v_init, tau=self.tau,
-                v_threshold=self.v_threshold, v_reset=self.v_reset,
+        if self._impl_sparse is not None:
+            return self._impl_sparse.forward(
+                x, self.spec, self._ensure_params(), self.state,
             )
-            self.v = v_final
-            return spikes
-
-        # Input is already float32 spike tensor, just ensure contiguous
-        x_contig = x_flat.contiguous()
-
-        # Grid: one program per (batch, tile) × output channel blocks
-        BH, BW = 8, 16
-        GH = triton.cdiv(H_out, BH)
-        GW = triton.cdiv(W_out, BW)
-        N_TILES = B * GH * GW
-
-        # Prepare v_init
-        v_init = self.v if isinstance(self.v, torch.Tensor) else torch.zeros(
-            B, self.out_channels, H_out, W_out, dtype=torch.float32, device=device)
-        v_init = v_init.float().contiguous()
-
-        # Output buffers
-        spike_out = torch.empty(T * B, self.out_channels, H_out, W_out,
-                                dtype=torch.float32, device=device)
-        v_out = torch.empty_like(v_init)
-
-        def _grid(META):
-            return (N_TILES, triton.cdiv(self.out_channels, META["BLOCK_N"]))
-
-        sparse_streamfuse_conv3x3_bn_lif[_grid](
-            x_contig,
-            self._w_cl,
-            c['bias_arg'],
-            c['bn_scale_arg'],
-            c['bn_bias_arg'],
-            v_init,
-            spike_out,
-            v_out,
-            T, B,
-            C_IN=self.in_channels,
-            C_OUT=self.out_channels,
-            H=x.shape[3], W=x.shape[4],
-            H_OUT=H_out, W_OUT=W_out,
-            GH=GH, GW=GW,
-            HAS_BIAS=c['has_bias'],
-            HAS_BN=c['has_bn'],
-            DECAY=c['decay'],
-            RECIP_TAU=c['recip_tau'],
-            V_TH=float(self.v_threshold),
-            HAS_V_RESET=c['has_v_reset'],
-            V_RESET=c['v_reset_val'],
-            GROUP_SIZE_C=c['GSC'],
-            NUM_GROUPS=c['NUM_GROUPS'],
+        # SparseFlow unavailable; fall back to DenseKeep (Corollary 3.17)
+        return self._impl_dense.forward(
+            x, self.spec, self._ensure_params(), self.state,
         )
-
-        self.v = v_out
-        return spike_out.reshape(T, B, self.out_channels, H_out, W_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with TimeBlock(K) structure.
@@ -519,12 +491,12 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
         device = x.device
         K = min(self.K, T)
 
-        # Initialize v if needed
-        if not isinstance(self.v, torch.Tensor) or self.v.shape == ():
-            H_out = (x.shape[3] + 2 * self.padding - self.kernel_size) // self.stride + 1
-            W_out = (x.shape[4] + 2 * self.padding - self.kernel_size) // self.stride + 1
-            self.v = torch.zeros(B, self.out_channels, H_out, W_out,
-                                 dtype=torch.float32, device=device)
+        # Stage 2 refactor: state initialization via StateBuffer.
+        H_out = (x.shape[3] + 2 * self.padding - self.kernel_size) // self.stride + 1
+        W_out = (x.shape[4] + 2 * self.padding - self.kernel_size) // self.stride + 1
+        # Note: this just primes the buffer; the inner-path implementations
+        # (_dense_forward / _batchfold_forward / per-step fallback below)
+        # call self.state.get(...) themselves for the actual read.
 
         # Choose execution path
         use_lean = (
@@ -555,7 +527,11 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
             self._ensure_w_cl()
 
         spike_list = []
-        v = self.v
+        # Stage 2 refactor: state via StateBuffer.
+        v = self.state.get(
+            shape=(B, self.out_channels, H_out, W_out),
+            device=device, dtype=torch.float32,
+        )
 
         for block_start in range(0, T, K):
             block_end = min(block_start + K, T)
@@ -577,7 +553,7 @@ class STFusionConvBNLIF(_SJ_MEMORY_MODULE):
 
                 spike_list.append(spike_t)
 
-        self.v = v
+        self.state.set(v)
         return torch.stack(spike_list, dim=0)
 
     def extra_repr(self):

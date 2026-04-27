@@ -39,9 +39,15 @@ from spikingjelly.activation_based import layer as sj_layer
 from spikingjelly.activation_based import neuron as sj_neuron
 from spikingjelly.activation_based import functional as sj_functional
 
-from partial_fusion_conv_lif import partial_fusion_conv_lif, analytic_hbm_ratio
+from catfuse.kernels.partial_fusion_conv_lif_impl import (
+    partial_fusion_conv_lif, analytic_hbm_ratio,
+)
 
-# Phase 0 full Triton fusion reference
+# Phase 0 full Triton fusion reference (kept benchmark-internal)
+import sys, os
+_DIR = os.path.dirname(os.path.abspath(__file__))
+if _DIR not in sys.path:
+    sys.path.insert(0, _DIR)
 from conv_lif_min_v2 import run_fusion as full_triton_conv_lif_fusion
 
 

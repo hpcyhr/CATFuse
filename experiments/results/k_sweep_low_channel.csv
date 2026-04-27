@@ -1,0 +1,17 @@
+config,impl,T,B,Cin,Cout,H,W,sparsity,K,n_blocks,analytic_intermediate_io,handcomp_intermediate_io,formula_match,wall_us_median,parity_max_diff,schedule_str
+SEW-RN18 layer1.0.conv2  (64x32x32),DenseKeep,4,2,64,64,32,32,0.85,4,1,5242880,5242880,True,304.6808950603008,0.0,BatchFold(T)
+SEW-RN18 layer1.0.conv2  (64x32x32),SparseFlow,4,2,64,64,32,32,0.85,1,4,4194304,4194304,True,1010.05457341671,1.0,StreamFuse+SC
+SEW-RN18 layer1.0.conv2  (64x32x32),SparseFlow,4,2,64,64,32,32,0.85,2,2,2097152,2097152,True,635.7342842966318,1.0,StreamFuse+SC
+SEW-RN18 layer1.0.conv2  (64x32x32),SparseFlow,4,2,64,64,32,32,0.85,4,1,1048576,1048576,True,474.75969418883324,1.0,StreamFuse+SC
+SEW-RN18 layer2.0.conv2  (128x16x16),DenseKeep,4,2,128,128,16,16,0.85,4,1,2621440,2621440,True,336.4379797130823,0.0,BatchFold(T)
+SEW-RN18 layer2.0.conv2  (128x16x16),SparseFlow,4,2,128,128,16,16,0.85,1,4,2097152,2097152,True,1234.0449169278145,1.0,StreamFuse+SC
+SEW-RN18 layer2.0.conv2  (128x16x16),SparseFlow,4,2,128,128,16,16,0.85,2,2,1048576,1048576,True,897.7062348276377,1.0,StreamFuse+SC
+SEW-RN18 layer2.0.conv2  (128x16x16),SparseFlow,4,2,128,128,16,16,0.85,4,1,524288,524288,True,733.7197382003069,1.0,StreamFuse+SC
+Synthetic 64x32x32  (low-ch high-spatial),DenseKeep,4,2,64,64,32,32,0.85,4,1,5242880,5242880,True,308.75890515744686,0.0,BatchFold(T)
+Synthetic 64x32x32  (low-ch high-spatial),SparseFlow,4,2,64,64,32,32,0.85,1,4,4194304,4194304,True,1012.9539016634226,0.0,StreamFuse+SC
+Synthetic 64x32x32  (low-ch high-spatial),SparseFlow,4,2,64,64,32,32,0.85,2,2,2097152,2097152,True,641.3264758884907,0.0,StreamFuse+SC
+Synthetic 64x32x32  (low-ch high-spatial),SparseFlow,4,2,64,64,32,32,0.85,4,1,1048576,1048576,True,472.48917631804943,0.0,StreamFuse+SC
+Synthetic 128x16x16  (mid-ch mid-spatial),DenseKeep,4,2,128,128,16,16,0.85,4,1,2621440,2621440,True,343.1289177387953,0.0,BatchFold(T)
+Synthetic 128x16x16  (mid-ch mid-spatial),SparseFlow,4,2,128,128,16,16,0.85,1,4,2097152,2097152,True,1204.4524773955345,0.0,StreamFuse+SC
+Synthetic 128x16x16  (mid-ch mid-spatial),SparseFlow,4,2,128,128,16,16,0.85,2,2,1048576,1048576,True,892.9128386080265,0.0,StreamFuse+SC
+Synthetic 128x16x16  (mid-ch mid-spatial),SparseFlow,4,2,128,128,16,16,0.85,4,1,524288,524288,True,736.0274996608496,0.0,StreamFuse+SC

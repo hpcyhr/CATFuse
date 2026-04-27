@@ -1,0 +1,4 @@
+K,expected_launches_per_forward,streamfuse_launches,total_cuda_kernels,other_launches,streamfuse_kernel_name,notes
+1,4,4,17,13,sparse_streamfuse_conv3x3_bn_lif_0d1d2d3d4d5d6d7d8c9,match
+2,2,2,9,7,sparse_streamfuse_conv3x3_bn_lif_0d1d2d3d4d5d6d7d89,match
+4,1,1,5,4,sparse_streamfuse_conv3x3_bn_lif_0d1d2d3d4d5d6d7d89,match

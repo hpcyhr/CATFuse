@@ -34,18 +34,6 @@ module structures (Phase 3 task 3.0 prerequisite).
 """
 
 from __future__ import annotations
-
-import os
-import sys
-
-# Auto-resolve benchmarks/ path for Phase 0/2 kernel imports.
-# This file lives at /data/yhr/CATFuse/catfuse_patterns.py and needs to
-# import kernels from /data/yhr/CATFuse/benchmarks/.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_BENCHMARKS_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'benchmarks')
-if _BENCHMARKS_DIR not in sys.path:
-    sys.path.insert(0, _BENCHMARKS_DIR)
-
 from typing import Optional
 
 import torch
@@ -72,52 +60,42 @@ class CTFPattern(_SJMemoryModule):
 
     Inherits from SJ's MemoryModule so that functional.reset_net recognizes
     CTF patterns as proper SJ-compatible modules and does not emit warnings.
-    CTF patterns carry state only inside Triton kernel register files
-    per-call, so reset_net is a no-op for us.
+
+    CSR state (e.g. LIF membrane potential) is held in StateBuffer instances
+    registered via `_register_state(...)`. The base class's `reset()` method
+    delegates to all registered StateBuffers, so SJ's functional.reset_net
+    correctly clears v across the entire fused module tree.
     """
 
     policy_row: Optional[int] = None
 
     def __init__(self):
         super().__init__()
+        # List of StateBuffer instances managed by this pattern.
         # MemoryModule.__init__ already sets up _memories and _memories_rv
         # as OrderedDicts, so we don't need to redeclare them.
+        self._catfuse_states: list = []
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [T, B, ...] tensor in SJ multi-step convention (fp32, CUDA, contiguous)
-        Returns:
-            spike output of same or transformed shape
-        """
-        raise NotImplementedError
+    # ---- StateBuffer registration ------------------------------------
 
-    @classmethod
-    def from_sj_modules(cls, *sj_modules, **kwargs):
-        """
-        Build a CTF pattern instance by copying weights/parameters from
-        the corresponding SJ original modules.
-        """
-        raise NotImplementedError
+    def _register_state(self, state) -> None:
+        """Register a StateBuffer for unified reset() management.
 
-    def reset(self):
+        Called from subclass __init__ after constructing each StateBuffer.
+        Stage 2 refactor — see catfuse/state.py.
         """
-        Reset — no-op for CTF patterns (state is per-call in kernel registers).
-        Override the MemoryModule reset to avoid iterating over empty memories.
-        """
-        pass
+        from catfuse.state import StateBuffer
+        if not isinstance(state, StateBuffer):
+            raise TypeError(
+                f"_register_state expects a StateBuffer, got {type(state).__name__}"
+            )
+        # Initialize list if not present (defensive: __init__ may be skipped
+        # via __new__ in some subclass patterns).
+        if not hasattr(self, "_catfuse_states") or self._catfuse_states is None:
+            self._catfuse_states = []
+        self._catfuse_states.append(state)
 
-    def single_step_forward(self, x):
-        """
-        SJ MemoryModule expects step_mode logic. CTF patterns are always
-        multi-step (operate on [T, B, ...] input), so single_step is just
-        a pass-through to forward.
-        """
-        return self.forward(x)
-
-    def multi_step_forward(self, x_seq):
-        """Multi-step forward is just our forward."""
-        return self.forward(x_seq)
+    # ---- Pattern API -------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -140,13 +118,27 @@ class CTFPattern(_SJMemoryModule):
         raise NotImplementedError
 
     def reset(self):
+        """Reset all registered StateBuffer instances.
+
+        Called by SJ's functional.reset_net via the MemoryModule protocol.
+        Subclasses that hold child CTFPattern instances do NOT need to
+        recursively call reset() on children — SJ's reset_net handles tree
+        traversal automatically.
         """
-        Reset any internal state. For CTF patterns, state is carried inside
-        the kernel's register file per-call, so there's no persistent state
-        to reset at the module level. Override in subclasses that maintain
-        persistent buffers.
+        for state in getattr(self, "_catfuse_states", []):
+            state.reset()
+
+    def single_step_forward(self, x):
         """
-        pass
+        SJ MemoryModule expects step_mode logic. CTF patterns are always
+        multi-step (operate on [T, B, ...] input), so single_step is just
+        a pass-through to forward.
+        """
+        return self.forward(x)
+
+    def multi_step_forward(self, x_seq):
+        """Multi-step forward is just our forward."""
+        return self.forward(x_seq)
 
 
 # ============================================================
@@ -191,8 +183,8 @@ class PartialFusionConvLIF(CTFPattern):
         self.step_mode = "m"  # Tell SJ to pass full [T,B,C,H,W] in multi-step mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Import here to avoid circular import at module load
-        from partial_fusion_conv_lif import partial_fusion_conv_lif
+        # Imported from catfuse.kernels (Stage 1 refactor: moved from benchmarks/).
+        from catfuse.kernels.partial_fusion_conv_lif_impl import partial_fusion_conv_lif
         return partial_fusion_conv_lif(
             x, self.weight,
             tau=self.tau, v_th=self.v_threshold, v_reset=self.v_reset,
@@ -250,6 +242,10 @@ class PartialFusionConvBNLIF(CTFPattern):
         TimeBlock(T) o StreamFuse(BN, LIF) o StateCarry(LIF)
     (Conv is NOT StreamFused because cuDNN must write z to HBM)
 
+    Stage 3 refactor: forward logic delegates to a DenseKeep Implementation
+    (Definition 3.16.1). The pattern owns weights, BN params, and state,
+    while the impl owns the bit-exact realization (cuDNN conv + Triton LIF).
+
     Phase 2 task 2.1b: 1.74x vs SJ cupy on V100, near-bit-exact parity (0-2 flips/102M).
     """
 
@@ -284,6 +280,61 @@ class PartialFusionConvBNLIF(CTFPattern):
         nn.init.kaiming_normal_(self.weight)
         self.step_mode = "m"  # Tell SJ to pass full [T,B,C,H,W] in multi-step mode
 
+        # Stage 2 refactor: CSR state through StateBuffer instead of self._v
+        # plain attribute. Registered for unified reset() via CTFPattern.
+        from catfuse.state import StateBuffer
+        self.state = StateBuffer()
+        self._register_state(self.state)
+
+        # Stage 3 refactor: delegate forward math to a DenseKeep Implementation.
+        # Spec is frozen at construction; params (bn-folded BN affine) are
+        # rebuilt lazily when running_mean/var change identity (e.g. after .to()).
+        from catfuse.implementations import ConvLIFSpec, DenseKeep
+        self.spec = ConvLIFSpec(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            has_conv_bias=False,
+            has_bn=True,
+            tau=float(tau),
+            v_threshold=float(v_threshold),
+            v_reset=float(v_reset) if v_reset is not None else None,
+            decay_input=True,
+            bn_eps=float(bn_eps),
+        )
+        self._impl = DenseKeep()
+        self._params = None       # type: ignore[assignment]
+        self._params_key = None   # type: ignore[assignment]
+
+    def _ensure_params(self):
+        """Lazily build ConvLIFParams from raw BN params.
+
+        Cached by identity of (bn_weight, bn_bias, running_mean, running_var).
+        Identity changes on .to(device) for buffers, so cache auto-invalidates.
+        """
+        key = (id(self.bn_weight), id(self.bn_bias),
+               id(self.running_mean), id(self.running_var))
+        if self._params_key == key and self._params is not None:
+            return self._params
+        with torch.no_grad():
+            inv_std = torch.rsqrt(self.running_var + self.bn_eps)
+            bn_scale = (self.bn_weight * inv_std).detach()
+            bn_bias_folded = (self.bn_bias - self.running_mean * bn_scale).detach()
+        from catfuse.implementations import ConvLIFParams
+        self._params = ConvLIFParams(
+            weight=self.weight,
+            bias=None,
+            bn_scale=bn_scale,
+            bn_bias=bn_bias_folded,
+        )
+        self._params_key = key
+        # Impl's own caches (e.g. DenseKeep._w_fused) are keyed on params
+        # tensor identity, so they invalidate automatically when bn_scale/
+        # bn_bias_folded are re-derived above.
+        return self._params
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Self-contained BatchFold Conv + BN + LIF forward.
 
@@ -291,72 +342,10 @@ class PartialFusionConvBNLIF(CTFPattern):
         Returns: spike tensor, same shape as x but with C_out channels
         """
         if x.ndim == 4:
-            # Single-step mode: wrap in T=1
-            return self._forward_impl(x.unsqueeze(0)).squeeze(0)
-        return self._forward_impl(x)
-
-    def _ensure_bn_folded(self):
-        """Fold BN into conv weight+bias (once). One F.conv2d = Conv+BN."""
-        if not hasattr(self, "_w_fused") or self._w_fused is None:
-            with torch.no_grad():
-                inv_std = torch.rsqrt(self.running_var + self.bn_eps)
-                scale = self.bn_weight * inv_std  # [C_out]
-                # Fold scale into conv weight: w_fused[co,ci,kh,kw] = w[co,ci,kh,kw] * scale[co]
-                self._w_fused = (self.weight * scale.view(-1, 1, 1, 1)).detach()
-                # Fold bias: b_fused = bn_bias - running_mean * scale + conv_bias * scale
-                self._b_fused = (self.bn_bias - self.running_mean * scale).detach()
-                if getattr(self, 'conv_bias', None) is not None:
-                    self._b_fused = self._b_fused + (self.conv_bias * scale).detach()
-
-    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
-        """Core forward: x is [T, B, C_in, H, W]."""
-        T, B = x.shape[0], x.shape[1]
-        self._ensure_bn_folded()
-
-        # StaticZero check: if entire input is zero, skip conv
-        # Cost: one reduction (~0.005ms) vs cuDNN conv (~0.1-0.2ms)
-        x_4d = x.reshape(T * B, x.shape[2], x.shape[3], x.shape[4])
-        if not x_4d.any():
-            # z = bias only (BN already folded into weight+bias)
-            H_out = (x.shape[3] + 2 * self.padding - self.kernel_size) // self.stride + 1
-            W_out = (x.shape[4] + 2 * self.padding - self.kernel_size) // self.stride + 1
-            z_4d = self._b_fused.view(1, -1, 1, 1).expand(T * B, -1, H_out, W_out).clone()
-        else:
-            # 1. BatchFold + cuDNN conv (BN fully folded into weight+bias = 1 launch)
-            z_4d = F.conv2d(x_4d, self._w_fused, bias=self._b_fused,
-                            stride=self.stride, padding=self.padding)
-        H_out, W_out = z_4d.shape[2], z_4d.shape[3]
-
-        # 2. Reshape to [T, B, C_out, H_out, W_out]
-        z = z_4d.reshape(T, B, self.out_channels, H_out, W_out)
-
-        # 4. Single-launch Triton LIF over T steps
-        if not hasattr(self, "_v") or self._v is None:
-            self._v = torch.zeros(B, self.out_channels, H_out, W_out,
-                                  dtype=torch.float32, device=z.device)
-        try:
-            from catfuse.sparseflow.lif_seq_kernel import lif_sequential
-            spikes, v_out = lif_sequential(
-                z, self._v, tau=self.tau,
-                v_threshold=self.v_threshold, v_reset=self.v_reset,
-            )
-            self._v = v_out.detach()
-            return spikes
-        except Exception:
-            # Fallback to Python loop
-            v = self._v
-            spikes = []
-            for t in range(T):
-                v = v + (z[t] - (v - self.v_reset)) / self.tau
-                spike = (v >= self.v_threshold).to(z.dtype)
-                v = v * (1.0 - spike) + self.v_reset * spike
-                spikes.append(spike)
-            self._v = v.detach()
-            return torch.stack(spikes, dim=0)
-
-    def reset(self):
-        """Reset membrane potential (called by functional.reset_net)."""
-        self._v = None
+            return self._impl.forward(
+                x.unsqueeze(0), self.spec, self._ensure_params(), self.state
+            ).squeeze(0)
+        return self._impl.forward(x, self.spec, self._ensure_params(), self.state)
 
     @classmethod
     def from_sj_modules(cls,
@@ -458,7 +447,7 @@ class PartialFusionConvBNAddLIF(CTFPattern):
         Returns:
             spike [T, B, C_out, H_out, W_out]
         """
-        from partial_fusion_conv_bn_add_lif import partial_fusion_conv_bn_add_lif
+        from catfuse.kernels.partial_fusion_conv_bn_add_lif_impl import partial_fusion_conv_bn_add_lif
         return partial_fusion_conv_bn_add_lif(
             x, identity, self.weight,
             self.bn_weight, self.bn_bias,
@@ -528,6 +517,11 @@ class FusedLinearLIF(CTFPattern):
         self.weight_io = nn.Parameter(torch.empty(in_features, out_features))
         nn.init.kaiming_normal_(self.weight_io.T)
 
+        # Stage 2 refactor: CSR state through StateBuffer instead of self._v_lin.
+        from catfuse.state import StateBuffer
+        self.state = StateBuffer()
+        self._register_state(self.state)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Self-contained BatchFold Linear + LIF forward.
         x: [T, B, C_in] or [B, C_in]
@@ -551,32 +545,36 @@ class FusedLinearLIF(CTFPattern):
         z = z_2d.reshape(T, B, -1)
         # 2. Triton LIF or fallback
         C_out = z.shape[2]
-        if not hasattr(self, "_v_lin") or self._v_lin is None:
-            self._v_lin = torch.zeros(B, C_out, dtype=torch.float32, device=z.device)
+        # Stage 2 refactor: state via StateBuffer.
+        v_in_2d = self.state.get(
+            shape=(B, C_out),
+            device=z.device,
+            dtype=torch.float32,
+        )
         try:
             from catfuse.sparseflow.lif_seq_kernel import lif_sequential
             # lif_sequential expects [T, B, C, H, W], add dummy spatial dims
             z_5d = z.unsqueeze(-1).unsqueeze(-1)  # [T, B, C, 1, 1]
-            v_5d = self._v_lin.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+            v_5d = v_in_2d.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
             spikes_5d, v_out_5d = lif_sequential(
                 z_5d, v_5d, tau=self.tau,
                 v_threshold=self.v_threshold, v_reset=self.v_reset,
             )
-            self._v_lin = v_out_5d.squeeze(-1).squeeze(-1).detach()
+            self.state.set(v_out_5d.squeeze(-1).squeeze(-1))
             return spikes_5d.squeeze(-1).squeeze(-1)
         except Exception:
-            v = self._v_lin
+            v = v_in_2d
             spikes = []
             for t in range(T):
                 v = v + (z[t] - (v - self.v_reset)) / self.tau
                 spike = (v >= self.v_threshold).to(z.dtype)
                 v = v * (1.0 - spike) + self.v_reset * spike
                 spikes.append(spike)
-            self._v_lin = v.detach()
+            self.state.set(v)
             return torch.stack(spikes, dim=0)
 
-    def reset(self):
-        self._v_lin = None
+    # Stage 2 refactor: reset() inherited from CTFPattern, delegates to
+    # registered StateBuffer (no explicit override needed).
 
     @classmethod
     def from_sj_modules(cls,

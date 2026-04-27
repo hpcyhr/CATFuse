@@ -1,0 +1,13 @@
+input_source,layer_name,Cin,Cout,H,W,n_calls,n_sf,n_dk,n_static_zero,sparsity_min,sparsity_max,sparsity_mean,sf_fraction
+synthetic,layer3.0.conv2,256,256,2,2,10,0,0,10,1.0,1.0,1.0,0.0
+synthetic,layer3.1.conv1,256,256,2,2,10,0,0,10,1.0,1.0,1.0,0.0
+synthetic,layer3.1.conv2,256,256,2,2,10,0,0,10,1.0,1.0,1.0,0.0
+synthetic,layer4.0.conv2,512,512,1,1,10,0,0,10,1.0,1.0,1.0,0.0
+synthetic,layer4.1.conv1,512,512,1,1,10,0,0,10,1.0,1.0,1.0,0.0
+synthetic,layer4.1.conv2,512,512,1,1,10,0,0,10,1.0,1.0,1.0,0.0
+cifar10,layer3.0.conv2,256,256,2,2,10,0,0,10,1.0,1.0,1.0,0.0
+cifar10,layer3.1.conv1,256,256,2,2,10,0,0,10,1.0,1.0,1.0,0.0
+cifar10,layer3.1.conv2,256,256,2,2,10,0,0,10,1.0,1.0,1.0,0.0
+cifar10,layer4.0.conv2,512,512,1,1,10,0,0,10,1.0,1.0,1.0,0.0
+cifar10,layer4.1.conv1,512,512,1,1,10,0,0,10,1.0,1.0,1.0,0.0
+cifar10,layer4.1.conv2,512,512,1,1,10,0,0,10,1.0,1.0,1.0,0.0

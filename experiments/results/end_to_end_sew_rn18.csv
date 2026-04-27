@@ -1,0 +1,13 @@
+impl,B,T,wall_us_median,parity_max_diff,notes
+SJ-eager,1,4,10447.854567319155,0.0,"loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,1,4,7006.044229492545,0.0,force_sparse=False
+CATFuse-default,1,4,11122.399708256125,0.19820785522460938,13 DK + 7 SF (default routing)
+SJ-eager,2,4,12857.31288138777,0.0,"loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,2,4,7375.490819104016,0.0,force_sparse=False
+CATFuse-default,2,4,11345.610502175987,0.11959075927734375,13 DK + 7 SF (default routing)
+SJ-eager,8,4,12640.307359397411,0.0,"loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,8,4,7591.717890463769,0.0,force_sparse=False
+CATFuse-default,8,4,11754.900482483208,1.4187836647033691,13 DK + 7 SF (default routing)
+SJ-eager,32,4,17423.16230200231,0.0,"loaded from /data/yhr/CATFuse/checkpoints/sew_resnet18_cifar10_lif_best.pth (epoch=2, test_acc=0.6310)"
+CATFuse-DK,32,4,14891.560850664973,0.10307741165161133,force_sparse=False
+CATFuse-default,32,4,28465.041602030396,0.7778005599975586,13 DK + 7 SF (default routing)
